@@ -50,6 +50,15 @@ make compose-down
 
 ## API Examples
 
+The service generates an OpenAPI 3.1 specification with Huma:
+
+```sh
+curl -sS http://localhost:8080/openapi.json
+open http://localhost:8080/docs
+```
+
+All public feed/media/health endpoints and protected `/api/...` endpoints are included. Protected operations document the bearer API-key requirement.
+
 Create a show:
 
 ```sh

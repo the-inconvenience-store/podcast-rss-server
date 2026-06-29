@@ -8,10 +8,11 @@ import (
 	"mime"
 	"net/http"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/adapters/humago"
 	"github.com/samstevens/podcast-rss/internal/auth"
 	"github.com/samstevens/podcast-rss/internal/feed"
 	"github.com/samstevens/podcast-rss/internal/media"
@@ -34,29 +35,189 @@ type Server struct {
 	cfg   Config
 }
 
+const apiVersion = "0.1.0"
+
 func New(repo podcast.Repository, store storage.Storage, cfg Config) http.Handler {
 	if cfg.Now == nil {
 		cfg.Now = func() time.Time { return time.Now().UTC() }
 	}
 	s := &Server{repo: repo, store: store, cfg: cfg}
-	api := auth.Middleware(cfg.APIKeys)(http.HandlerFunc(s.api))
+	mux := http.NewServeMux()
+	humaAPI := humago.New(mux, humaConfig())
+	documentOperations(humaAPI)
+
+	authenticated := auth.Middleware(cfg.APIKeys)
 	mediaHandler := media.Handler(store)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasPrefix(r.URL.Path, "/api/"):
-			api.ServeHTTP(w, r)
-		case r.URL.Path == "/healthz" && r.Method == http.MethodGet:
-			s.health(w, r)
-		case r.URL.Path == "/" && r.Method == http.MethodGet:
-			s.rootFeed(w, r)
-		case strings.HasPrefix(r.URL.Path, "/feeds/") && r.Method == http.MethodGet:
-			s.namedFeed(w, r)
-		case strings.HasPrefix(r.URL.Path, "/media/") && r.Method == http.MethodGet:
-			mediaHandler.ServeHTTP(w, r)
-		default:
-			http.NotFound(w, r)
+	mux.HandleFunc("GET /{$}", s.rootFeed)
+	mux.HandleFunc("GET /healthz", s.health)
+	mux.HandleFunc("GET /feeds/{feedFile}", s.namedFeed)
+	mux.Handle("GET /media/{showID}/{episodeID}/{filename}", mediaHandler)
+	mux.Handle("GET /api/shows", authenticated(http.HandlerFunc(s.listShows)))
+	mux.Handle("POST /api/shows", authenticated(http.HandlerFunc(s.createShow)))
+	mux.Handle("GET /api/shows/{id}", authenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.getShow(w, r, r.PathValue("id"))
+	})))
+	mux.Handle("PATCH /api/shows/{id}", authenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.patchShow(w, r, r.PathValue("id"))
+	})))
+	mux.Handle("DELETE /api/shows/{id}", authenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.deleteShow(w, r, r.PathValue("id"))
+	})))
+	mux.Handle("POST /api/shows/{id}/image", authenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.uploadShowImage(w, r, r.PathValue("id"))
+	})))
+	mux.Handle("POST /api/shows/{id}/episodes", authenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.createEpisode(w, r, r.PathValue("id"))
+	})))
+	mux.Handle("PATCH /api/shows/{id}/episodes/{eid}", authenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.patchEpisode(w, r, r.PathValue("id"), r.PathValue("eid"))
+	})))
+	mux.Handle("DELETE /api/shows/{id}/episodes/{eid}", authenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.deleteEpisode(w, r, r.PathValue("id"), r.PathValue("eid"))
+	})))
+	mux.Handle("POST /api/shows/{id}/episodes/{eid}/audio", authenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.uploadEpisodeAudio(w, r, r.PathValue("id"), r.PathValue("eid"))
+	})))
+	mux.Handle("POST /api/shows/{id}/episodes/{eid}/image", authenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.uploadEpisodeImage(w, r, r.PathValue("id"), r.PathValue("eid"))
+	})))
+	return mux
+}
+
+func humaConfig() huma.Config {
+	cfg := huma.DefaultConfig("Podcast RSS Service", apiVersion)
+	cfg.Components.SecuritySchemes = map[string]*huma.SecurityScheme{
+		"apiKey": {
+			Type:        "http",
+			Scheme:      "bearer",
+			Description: "API key supplied as `Authorization: Bearer <key>`. `X-API-Key` is also accepted by the service.",
+		},
+	}
+	return cfg
+}
+
+func documentOperations(api huma.API) {
+	for _, op := range []huma.Operation{
+		publicOperation(http.MethodGet, "/", "get-primary-feed", "Feeds", "Get primary podcast RSS feed", "application/rss+xml"),
+		publicOperation(http.MethodGet, "/feeds/{showID}.xml", "get-show-feed", "Feeds", "Get podcast RSS feed by show ID", "application/rss+xml", pathParam("showID")),
+		publicOperation(http.MethodGet, "/media/{showID}/{episodeID}/{filename}", "get-media", "Media", "Get proxied podcast media with HTTP range support", "application/octet-stream", pathParam("showID"), pathParam("episodeID"), pathParam("filename")),
+		{
+			Method:      http.MethodGet,
+			Path:        "/healthz",
+			OperationID: "get-healthz",
+			Tags:        []string{"Health"},
+			Summary:     "Health check",
+			Responses: map[string]*huma.Response{
+				"204": {Description: "Service is healthy"},
+			},
+		},
+		apiOperation(http.MethodGet, "/api/shows", "list-shows", "Shows", "List shows", nil),
+		apiOperation(http.MethodPost, "/api/shows", "create-show", "Shows", "Create show", jsonRequest("Show metadata")),
+		apiOperation(http.MethodGet, "/api/shows/{id}", "get-show", "Shows", "Get show", nil, pathParam("id")),
+		apiOperation(http.MethodPatch, "/api/shows/{id}", "patch-show", "Shows", "Update show", jsonRequest("Partial show metadata"), pathParam("id")),
+		apiOperation(http.MethodDelete, "/api/shows/{id}", "delete-show", "Shows", "Delete show and stored objects", nil, pathParam("id")),
+		apiOperation(http.MethodPost, "/api/shows/{id}/image", "upload-show-image", "Uploads", "Upload show cover artwork", multipartRequest("JPEG or PNG cover artwork"), pathParam("id")),
+		apiOperation(http.MethodPost, "/api/shows/{id}/episodes", "create-episode", "Episodes", "Create episode", jsonRequest("Episode metadata"), pathParam("id")),
+		apiOperation(http.MethodPatch, "/api/shows/{id}/episodes/{eid}", "patch-episode", "Episodes", "Update episode", jsonRequest("Partial episode metadata"), pathParam("id"), pathParam("eid")),
+		apiOperation(http.MethodDelete, "/api/shows/{id}/episodes/{eid}", "delete-episode", "Episodes", "Delete episode and stored objects", nil, pathParam("id"), pathParam("eid")),
+		apiOperation(http.MethodPost, "/api/shows/{id}/episodes/{eid}/audio", "upload-episode-audio", "Uploads", "Upload episode audio", multipartRequest("Episode audio file"), pathParam("id"), pathParam("eid")),
+		apiOperation(http.MethodPost, "/api/shows/{id}/episodes/{eid}/image", "upload-episode-image", "Uploads", "Upload episode artwork", multipartRequest("JPEG or PNG episode artwork"), pathParam("id"), pathParam("eid")),
+	} {
+		current := op
+		api.OpenAPI().AddOperation(&current)
+	}
+}
+
+func publicOperation(method, path, id, tag, summary, contentType string, params ...*huma.Param) huma.Operation {
+	return huma.Operation{
+		Method:      method,
+		Path:        path,
+		OperationID: id,
+		Tags:        []string{tag},
+		Summary:     summary,
+		Parameters:  params,
+		Responses: map[string]*huma.Response{
+			"200": response("OK", contentType),
+		},
+	}
+}
+
+func apiOperation(method, path, id, tag, summary string, body *huma.RequestBody, params ...*huma.Param) huma.Operation {
+	status := "200"
+	if method == http.MethodPost {
+		status = "201"
+	}
+	if method == http.MethodDelete {
+		status = "204"
+	}
+	op := huma.Operation{
+		Method:      method,
+		Path:        path,
+		OperationID: id,
+		Tags:        []string{tag},
+		Summary:     summary,
+		Parameters:  params,
+		RequestBody: body,
+		Security:    []map[string][]string{{"apiKey": {}}},
+		Responses: map[string]*huma.Response{
+			status: response("Success", "application/json"),
+			"401":  {Description: "Missing or invalid API key"},
+		},
+	}
+	if method == http.MethodDelete {
+		op.Responses = map[string]*huma.Response{
+			status: {Description: "Deleted"},
+			"401":  {Description: "Missing or invalid API key"},
 		}
-	})
+	}
+	return op
+}
+
+func response(description, contentType string) *huma.Response {
+	return &huma.Response{
+		Description: description,
+		Content: map[string]*huma.MediaType{
+			contentType: {Schema: &huma.Schema{Type: "string"}},
+		},
+	}
+}
+
+func jsonRequest(description string) *huma.RequestBody {
+	return &huma.RequestBody{
+		Description: description,
+		Required:    true,
+		Content: map[string]*huma.MediaType{
+			"application/json": {Schema: &huma.Schema{Type: "object"}},
+		},
+	}
+}
+
+func multipartRequest(description string) *huma.RequestBody {
+	return &huma.RequestBody{
+		Description: description,
+		Required:    true,
+		Content: map[string]*huma.MediaType{
+			"multipart/form-data": {
+				Schema: &huma.Schema{
+					Type: "object",
+					Properties: map[string]*huma.Schema{
+						"file": {Type: "string", Format: "binary"},
+					},
+					Required: []string{"file"},
+				},
+			},
+		},
+	}
+}
+
+func pathParam(name string) *huma.Param {
+	return &huma.Param{
+		Name:        name,
+		In:          "path",
+		Required:    true,
+		Description: name + " path segment",
+		Schema:      &huma.Schema{Type: "string"},
+	}
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -118,65 +279,6 @@ func (s *Server) primaryShow() (podcast.Show, error) {
 		return podcast.Show{}, fmt.Errorf("primary show is ambiguous")
 	}
 	return shows[0], nil
-}
-
-func (s *Server) api(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/api")
-	switch {
-	case path == "/shows" && r.Method == http.MethodPost:
-		s.createShow(w, r)
-	case path == "/shows" && r.Method == http.MethodGet:
-		s.listShows(w, r)
-	case strings.HasPrefix(path, "/shows/"):
-		s.showRoute(w, r, strings.TrimPrefix(path, "/shows/"))
-	default:
-		http.NotFound(w, r)
-	}
-}
-
-func (s *Server) showRoute(w http.ResponseWriter, r *http.Request, rest string) {
-	parts := strings.Split(rest, "/")
-	if len(parts) == 1 {
-		switch r.Method {
-		case http.MethodGet:
-			s.getShow(w, r, parts[0])
-		case http.MethodPatch:
-			s.patchShow(w, r, parts[0])
-		case http.MethodDelete:
-			s.deleteShow(w, r, parts[0])
-		default:
-			http.NotFound(w, r)
-		}
-		return
-	}
-	if len(parts) == 2 && parts[1] == "image" && r.Method == http.MethodPost {
-		s.uploadShowImage(w, r, parts[0])
-		return
-	}
-	if len(parts) == 2 && parts[1] == "episodes" && r.Method == http.MethodPost {
-		s.createEpisode(w, r, parts[0])
-		return
-	}
-	if len(parts) == 3 && parts[1] == "episodes" {
-		switch r.Method {
-		case http.MethodPatch:
-			s.patchEpisode(w, r, parts[0], parts[2])
-		case http.MethodDelete:
-			s.deleteEpisode(w, r, parts[0], parts[2])
-		default:
-			http.NotFound(w, r)
-		}
-		return
-	}
-	if len(parts) == 4 && parts[1] == "episodes" && parts[3] == "audio" && r.Method == http.MethodPost {
-		s.uploadEpisodeAudio(w, r, parts[0], parts[2])
-		return
-	}
-	if len(parts) == 4 && parts[1] == "episodes" && parts[3] == "image" && r.Method == http.MethodPost {
-		s.uploadEpisodeImage(w, r, parts[0], parts[2])
-		return
-	}
-	http.NotFound(w, r)
 }
 
 type showRequest struct {
@@ -636,10 +738,3 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
-
-func atoi(value string) int {
-	parsed, _ := strconv.Atoi(value)
-	return parsed
-}
-
-var _ = atoi
