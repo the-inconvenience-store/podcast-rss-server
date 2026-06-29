@@ -2,11 +2,14 @@ package server_test
 
 import (
 	"bytes"
-	"encoding/json"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"strings"
 	"testing"
 	"time"
@@ -156,6 +159,52 @@ func TestAudioUploadUpdatesMetadataMediaEndpointAndFeed(t *testing.T) {
 	}
 }
 
+func TestArtworkUploadsValidateStoreAndUpdateFeed(t *testing.T) {
+	repo := podcast.NewMemoryRepository()
+	store := storage.NewMemory()
+	handler := server.New(repo, store, server.Config{
+		APIKeys:       []string{"test-key"},
+		PublicBaseURL: "https://podcasts.example.com",
+		Now:           func() time.Time { return mustTime(t, "2025-01-07T10:00:00Z") },
+	})
+	mustCreateShowAndEpisode(t, handler)
+	imageBytes := serverPNG(t, 1400, 1400)
+
+	showUpload := authReq(http.MethodPost, "/api/shows/show-1/image", multipartBody(t, "cover.png", "image/png", imageBytes))
+	showUpload.Header.Set("Content-Type", lastMultipartContentType)
+	showResp := httptest.NewRecorder()
+	handler.ServeHTTP(showResp, showUpload)
+	if showResp.Code != http.StatusOK {
+		t.Fatalf("show image status=%d body=%s", showResp.Code, showResp.Body.String())
+	}
+
+	episodeUpload := authReq(http.MethodPost, "/api/shows/show-1/episodes/episode-1/image", multipartBody(t, "episode.png", "image/png", imageBytes))
+	episodeUpload.Header.Set("Content-Type", lastMultipartContentType)
+	episodeResp := httptest.NewRecorder()
+	handler.ServeHTTP(episodeResp, episodeUpload)
+	if episodeResp.Code != http.StatusOK {
+		t.Fatalf("episode image status=%d body=%s", episodeResp.Code, episodeResp.Body.String())
+	}
+
+	feedResp := httptest.NewRecorder()
+	handler.ServeHTTP(feedResp, httptest.NewRequest(http.MethodGet, "/", nil))
+	feedBody := feedResp.Body.String()
+	if !strings.Contains(feedBody, `itunes:image href="https://podcasts.example.com/media/show-1/show/cover.png"`) {
+		t.Fatalf("feed missing show image URL:\n%s", feedBody)
+	}
+	if !strings.Contains(feedBody, `itunes:image href="https://podcasts.example.com/media/show-1/episode-1/episode.png"`) {
+		t.Fatalf("feed missing episode image URL:\n%s", feedBody)
+	}
+
+	badUpload := authReq(http.MethodPost, "/api/shows/show-1/image", multipartBody(t, "bad.gif", "image/gif", []byte("GIF89a")))
+	badUpload.Header.Set("Content-Type", lastMultipartContentType)
+	badResp := httptest.NewRecorder()
+	handler.ServeHTTP(badResp, badUpload)
+	if badResp.Code != http.StatusBadRequest {
+		t.Fatalf("invalid image status=%d, want 400", badResp.Code)
+	}
+}
+
 func TestDeletingShowRemovesStoredObjects(t *testing.T) {
 	repo := podcast.NewMemoryRepository()
 	store := storage.NewMemory()
@@ -243,9 +292,36 @@ func mustTime(t *testing.T, value string) time.Time {
 	return parsed
 }
 
-func decodeJSON(t *testing.T, body *bytes.Buffer, dst any) {
+var lastMultipartContentType string
+
+func multipartBody(t *testing.T, filename, contentType string, data []byte) io.Reader {
 	t.Helper()
-	if err := json.Unmarshal(body.Bytes(), dst); err != nil {
-		t.Fatalf("decode JSON %q: %v", body.String(), err)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", `form-data; name="file"; filename="`+filename+`"`)
+	header.Set("Content-Type", contentType)
+	part, err := writer.CreatePart(header)
+	if err != nil {
+		t.Fatalf("CreatePart: %v", err)
 	}
+	if _, err := part.Write(data); err != nil {
+		t.Fatalf("write part: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	lastMultipartContentType = writer.FormDataContentType()
+	return &body
+}
+
+func serverPNG(t *testing.T, width, height int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	img.Set(0, 0, color.RGBA{G: 255, A: 255})
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return buf.Bytes()
 }

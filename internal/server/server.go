@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"github.com/samstevens/podcast-rss/internal/podcast"
 	"github.com/samstevens/podcast-rss/internal/safe"
 	"github.com/samstevens/podcast-rss/internal/storage"
+	"github.com/samstevens/podcast-rss/internal/validation"
 )
 
 type Config struct {
@@ -448,11 +450,83 @@ func (s *Server) uploadEpisodeAudio(w http.ResponseWriter, r *http.Request, show
 }
 
 func (s *Server) uploadShowImage(w http.ResponseWriter, r *http.Request, showID string) {
-	http.Error(w, "image upload not implemented", http.StatusNotImplemented)
+	show, err := s.repo.GetShow(showID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	filename, info, err := s.storeArtwork(r, showID, "show")
+	if err != nil {
+		http.Error(w, "invalid image upload", http.StatusBadRequest)
+		return
+	}
+	show.ImageFileName = filename
+	show.ImageURL = s.mediaURL(showID, "show", filename)
+	if err := s.repo.UpdateShow(show); err != nil {
+		http.Error(w, "could not update show", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
 }
 
 func (s *Server) uploadEpisodeImage(w http.ResponseWriter, r *http.Request, showID, episodeID string) {
-	http.Error(w, "image upload not implemented", http.StatusNotImplemented)
+	show, err := s.repo.GetShow(showID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	episode, ok := findEpisode(show, episodeID)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	filename, info, err := s.storeArtwork(r, showID, episodeID)
+	if err != nil {
+		http.Error(w, "invalid image upload", http.StatusBadRequest)
+		return
+	}
+	episode.ImageFileName = filename
+	episode.ImageURL = s.mediaURL(showID, episodeID, filename)
+	if err := s.repo.UpdateEpisode(showID, episode); err != nil {
+		http.Error(w, "could not update episode", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+func (s *Server) storeArtwork(r *http.Request, showID, episodeID string) (string, validation.ImageInfo, error) {
+	file, filename, declaredContentType, err := multipartFile(r)
+	if err != nil {
+		return "", validation.ImageInfo{}, err
+	}
+	defer file.Close()
+	filename, err = safe.PathPart(filename)
+	if err != nil {
+		return "", validation.ImageInfo{}, err
+	}
+	data, err := io.ReadAll(io.LimitReader(file, 20<<20))
+	if err != nil {
+		return "", validation.ImageInfo{}, err
+	}
+	info, err := validation.ValidateArtwork(bytes.NewReader(data), declaredContentType)
+	if err != nil {
+		return "", validation.ImageInfo{}, err
+	}
+	key, err := safe.MediaObjectKey(showID, episodeID, filename)
+	if err != nil {
+		return "", validation.ImageInfo{}, err
+	}
+	if err := s.store.Put(key, bytes.NewReader(data), storage.ObjectInfo{
+		Size:        int64(len(data)),
+		ContentType: info.ContentType,
+	}); err != nil {
+		return "", validation.ImageInfo{}, err
+	}
+	return filename, info, nil
+}
+
+func (s *Server) mediaURL(showID, episodeID, filename string) string {
+	return strings.TrimRight(s.cfg.PublicBaseURL, "/") + "/media/" + showID + "/" + episodeID + "/" + filename
 }
 
 func multipartFile(r *http.Request) (io.ReadCloser, string, string, error) {
