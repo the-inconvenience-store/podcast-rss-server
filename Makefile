@@ -1,7 +1,7 @@
 GOCACHE ?= $(CURDIR)/.cache/go-build
 VERSION ?= $(shell tr -d '[:space:]' < VERSION)
 
-.PHONY: test test-integration test-release-scripts lint run compose-up compose-down docker-plan docker-push docker-load version-patch version-minor version-major
+.PHONY: test test-integration test-release-scripts lint run compose-up compose-down docker-builder docker-plan docker-push docker-load version-patch version-minor version-major
 
 test:
 	GOCACHE=$(GOCACHE) go test ./...
@@ -27,6 +27,9 @@ compose-down:
 
 docker-plan:
 	scripts/docker-publish.sh --print $(VERSION)
+
+docker-builder:
+	scripts/docker-ensure-builder.sh
 
 docker-push:
 	scripts/docker-publish.sh --push $(VERSION)

@@ -50,7 +50,14 @@ if [ "$MODE" = "load" ]; then
   PLATFORMS=${PLATFORMS%%,*}
 fi
 
-CMD="docker buildx build --platform $PLATFORMS -t $REPO:$VERSION -t $REPO:$MINOR_TAG -t $REPO:latest $ACTION $ROOT_DIR"
+if [ "$MODE" = "push" ]; then
+  BUILDX_BUILDER=$("$ROOT_DIR/scripts/docker-ensure-builder.sh")
+  BUILDER_ARG="--builder $BUILDX_BUILDER"
+else
+  BUILDER_ARG=""
+fi
+
+CMD="docker buildx build $BUILDER_ARG --platform $PLATFORMS -t $REPO:$VERSION -t $REPO:$MINOR_TAG -t $REPO:latest $ACTION $ROOT_DIR"
 
 if [ "$MODE" = "print" ]; then
   printf '%s\n' "$CMD"

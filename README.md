@@ -165,6 +165,7 @@ Publish a multi-arch image for Kubernetes:
 
 ```sh
 docker login
+make docker-builder
 make docker-push
 ```
 
