@@ -1,0 +1,57 @@
+services:
+  garage:
+    image: dxflrs/garage:v1.0.1
+    command: ["server"]
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-data:/var/lib/garage
+    ports:
+      - "3900:3900"
+      - "3903:3903"
+
+  garage-init:
+    image: dxflrs/garage:v1.0.1
+    depends_on:
+      - garage
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-data:/var/lib/garage
+    environment:
+      GARAGE_RPC_SECRET: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      ACCESS_KEY_ID: podcast-local-access-key
+      SECRET_ACCESS_KEY: podcast-local-secret-key-change-me
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      '
+      until garage status >/tmp/status 2>/dev/null; do sleep 1; done;
+      NODE_ID=$$(garage status | awk "/^[0-9a-f]/{print \$$1; exit}");
+      garage layout assign -z dc1 -c 1G "$$NODE_ID" || true;
+      garage layout apply --version 1 || true;
+      garage bucket create podcasts || true;
+      garage key import --yes -a "$$ACCESS_KEY_ID" -s "$$SECRET_ACCESS_KEY" || true;
+      garage bucket allow --read --write --owner podcasts --key "$$ACCESS_KEY_ID" || true
+      '
+    restart: "no"
+
+  app:
+    build: .
+    depends_on:
+      garage-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      S3_ENDPOINT: http://garage:3900
+      S3_REGION: garage
+      S3_BUCKET: podcasts
+      DATABASE_PATH: /data/podcasts.db
+      LISTEN_ADDR: :8080
+      PUBLIC_BASE_URL: http://localhost:8080
+    volumes:
+      - app-data:/data
+    ports:
+      - "8080:8080"
+
+volumes:
+  garage-data:
+  app-data:
