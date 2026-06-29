@@ -1,0 +1,6 @@
+.cache/
+.git/
+.env
+*.db
+docker-compose.yml
+garage.toml

@@ -138,6 +138,38 @@ Run lint checks:
 make lint
 ```
 
+## Docker Hub Releases
+
+The image version is stored in `VERSION`. Bump it with:
+
+```sh
+make version-patch
+make version-minor
+make version-major
+```
+
+Set your Docker Hub namespace once per shell:
+
+```sh
+export DOCKERHUB_USERNAME=your-dockerhub-user
+# or: export DOCKERHUB_REPO=your-dockerhub-user/podcast-rss
+```
+
+Preview the buildx command:
+
+```sh
+make docker-plan
+```
+
+Publish a multi-arch image for Kubernetes:
+
+```sh
+docker login
+make docker-push
+```
+
+By default this pushes `linux/amd64` and `linux/arm64` tags for `VERSION`, `major.minor`, and `latest`.
+
 Run locally without Docker:
 
 ```sh
